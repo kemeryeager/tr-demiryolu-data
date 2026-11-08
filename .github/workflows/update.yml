@@ -1,0 +1,76 @@
+name: Update rail data
+
+on:
+  schedule:
+    - cron: '0 3 * * 1' # her Pazartesi 03:00 UTC
+  workflow_dispatch:
+
+# En az yetki: contents (gh-pages + last-check commit), actions (zamanlanmış iş akışını etkin tutmak için)
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: update-rail-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Checkout published data (gh-pages)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: gh-pages
+          path: pub
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: Build (Overpass, Turkey only)
+        run: node scripts/build.mjs
+
+      - name: Validate (must pass before publishing)
+        run: node scripts/validate.mjs pub/meta.json
+
+      - name: Publish if sha256 changed
+        id: publish
+        run: |
+          new=$(node -p "require('./out/meta.json').sha256")
+          old=$(node -p "try{require('./pub/meta.json').sha256}catch(e){''}")
+          echo "old=$old"; echo "new=$new"
+          if [ "$new" = "$old" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Veri değişmedi; yayın yok."
+            exit 0
+          fi
+          cp out/rail-tr.json out/meta.json pub/
+          cd pub
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rail-tr.json meta.json
+          git commit -m "Update rail data ($(node -p "require('./meta.json').osm_base"))"
+          git push origin HEAD:gh-pages
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Record last check (keeps repo active)
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          CHANGED: ${{ steps.publish.outputs.changed }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '{"checkedAt":"%s","result":"%s","published":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RESULT" "${CHANGED:-false}" > last-check.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last-check.json
+          git commit -m "chore: last check ($RESULT)" || true
+          git push origin HEAD:main
+          # Belgeler "repository activity"yi tanımlamıyor; ek güvence olarak zamanlanmış iş akışını API ile de (yeniden) etkinleştir.
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/update.yml/enable" || true
