@@ -2,8 +2,10 @@
 //   node scripts/build.mjs  ->  out/rail-tr.json (GeoJSON FeatureCollection) + out/meta.json
 //
 // SADECE Türkiye: Overpass sorguları area["ISO3166-1"="TR"][admin_level=2] ile sınırlıdır; dünya verisi indirilmez/işlenmez.
-// Geometri: 5 ondalık yuvarlama + Douglas-Peucker (~1.3 m). Özellikler kısadır: c (sınıf), k (renk anahtarı), s (azami hız),
-// d (yönlü hız), t (tünel), b (köprü), u (usage var), n (ad), m (metro/hafif raylı istasyonu).
+// Geometri: 5 ondalık yuvarlama + Douglas-Peucker (~1.3 m). Özellikler kısadır (tam liste: README.md):
+//   Stil anahtarları (DEĞİŞMEZ): c sınıf, k renk anahtarı, s azami hız, d yönlü hız, t tünel, b köprü, u usage var, n ad, m metro/hafif raylı istasyonu.
+//   Bilgi kartı (schemaVersion 2): r hat no, o işletmeci, e/v/f elektrifikasyon (kod, 4-7 = yaygın birleşimler / volt / Hz), x hat sayısı, g ray açıklığı (mm; 1 = 1435),
+//   us/sv ham usage/service (sınıftan çıkarılamıyorsa); yerler (c:'pl'): n ad, p yer türü, q idari seviye (4 il, 6 ilçe merkezi).
 //
 // schemaVersion: uygulamanın stillerinin dayandığı özellik adları / kategori değerleri değişirse ARTIRIN (ör. yeni 'c' sınıfı,
 // bir özelliğin adı ya da anlamı değişimi). Yalnızca veri güncellenirse (yeni OSM verisi) ARTIRMAYIN. Uygulama yalnızca kendi
@@ -21,7 +23,7 @@ const ENDPOINT = 'https://overpass-api.de/api/interpreter';
 const USER_AGENT = 'tr-demiryolu-build/1.0 (https://tr-demiryolu.app; Turkey railway map build script)';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OUT_DIR = path.join(ROOT, 'out');
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 const ATTRIBUTION = 'Demiryolu verisi © OpenStreetMap katkıda bulunanlar (ODbL 1.0) — https://www.openstreetmap.org/copyright';
 const CACHE_DIR = process.env.RAIL_CACHE_DIR || null;
 
@@ -35,13 +37,21 @@ const QUERIES = {
   nodes: `${HEAD}${AREA}(node["railway"~"^(station|halt|tram_stop|yard)$"](area.tr);node["public_transport"="station"]["train"="yes"](area.tr);node["public_transport"="station"]["subway"="yes"](area.tr);node["public_transport"="station"]["light_rail"="yes"](area.tr);node["public_transport"="station"]["tram"="yes"](area.tr););out geom;`,
 };
 
+// Yerler (arama için): şehir/kasaba düğümleri + il (admin_level=4) ve ilçe (6) idari merkezleri.
+// İlişkiler (area.tr) yerine sınır kutusuyla aranır (area ile ilişki sorgusu Overpass'ta 502 veriyordu); merkez düğümler yine yalnızca Türkiye alanında kalır.
+const PLACE_QUERIES = {
+  places: `${HEAD}${AREA}node["place"~"^(city|town)$"]["name"](area.tr);out;`,
+  admin4: `${HEAD}${AREA}rel["boundary"="administrative"]["admin_level"="4"](35.5,25.5,42.5,45.1)->.r;node(r.r:"admin_centre")(area.tr);out;`,
+  admin6: `${HEAD}${AREA}rel["boundary"="administrative"]["admin_level"="6"](35.5,25.5,42.5,45.1)->.r;node(r.r:"admin_centre")(area.tr);out;`,
+};
+
 async function overpass(name, query) {
   const cacheFile = CACHE_DIR ? path.join(CACHE_DIR, `${name}.json`) : null;
   if (cacheFile && existsSync(cacheFile)) {
     console.log(`[${name}] önbellekten okunuyor`);
     return JSON.parse(await readFile(cacheFile, 'utf8'));
   }
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       console.log(`[${name}] Overpass isteği (deneme ${attempt})...`);
       const res = await fetch(ENDPOINT, {
@@ -65,7 +75,7 @@ async function overpass(name, query) {
       return json;
     } catch (e) {
       console.warn(`[${name}] hata: ${e.message}`);
-      if (attempt === 2) throw e; // tek yeniden deneme
+      if (attempt === 3) throw e; // iki yeniden deneme
       await new Promise((r) => setTimeout(r, 90000));
     }
   }
@@ -115,6 +125,71 @@ function colorKey(rc) {
 
 const BRIDGES = new Set(['yes', 'cantilever', 'covered', 'movable', 'trestle', 'viaduct']);
 const MODE_KEY = { light_rail: 'l', subway: 'u', tram: 't' };
+
+// ---------- bilgi kartı alanları (schemaVersion 2) ----------
+
+const clean = (v, max) => {
+  if (v == null) return null;
+  const s = String(v).replace(/\s+/g, ' ').trim();
+  return s ? s.slice(0, max) : null;
+};
+const firstInt = (v, re) => {
+  if (v == null) return null;
+  const m = re.exec(String(v).split(';')[0].trim());
+  return m ? Math.round(Number(m[1])) : null;
+};
+// usage/service anahtarları 'c' ile kodlanmış olanlar yeniden yazılmaz
+const USAGE_IN_CLASS = new Set(['main', 'branch', 'industrial']);
+const MINOR_CLASSES = new Set(['siding', 'yard', 'cross', 'spur', 'inds']);
+const GONE_CLASSES = new Set(['dis', 'aba', 'raz']);
+// e kodları 4-7: [elektrifikasyon türü, volt, Hz] — 4 havai 25 kV 50 Hz, 5 havai 750 V DC, 6 üçüncü ray 750 V DC, 7 havai 1500 V DC
+const E_PRESETS = [[1, 25000, 50], [1, 750, 0], [2, 750, 0], [1, 1500, 0]];
+
+function addInfo(prop, t, usage, service) {
+  const name = clean(t.name || t['name:tr'], 100);
+  if (name) prop.n = name;
+  const ref = clean(t.ref, 30);
+  if (ref) prop.r = ref;
+  // BOYUT BÜTÇESİ: yan hatlarda (siding/yard/cross/spur/inds) işletmeci ve teknik alanlar yazılmaz; kullanılmayan hatlarda
+  // (dis/aba/raz) teknik alanlar yazılmaz (bilgi kartında en az işe yarayan alanlar).
+  const minor = MINOR_CLASSES.has(prop.c);
+  const technical = !minor && !GONE_CLASSES.has(prop.c);
+  const op = clean(t.operator, 60);
+  if (op && !minor) prop.o = op;
+  // elektrifikasyon: e 0 yok, 1 havai hat (contact_line / yes), 2 üçüncü ray (rail / 4th_rail), 3 diğer; v volt, f Hz (yalnız elektrikli hatlarda).
+  // Yaygın birleşimler tek kodla yazılır (e 4-7, bkz. E_PRESETS) ve v/f yazılmaz.
+  const el = technical && (t.electrified || t['construction:electrified'] || t['proposed:electrified']);
+  if (el) {
+    const first = String(el).split(';')[0].trim();
+    const e = first === 'no' ? 0 : first === 'contact_line' || first === 'yes' ? 1 : first === 'rail' || first === '4th_rail' ? 2 : 3;
+    let v, f;
+    if (e !== 0) {
+      v = firstInt(t.voltage, /^(\d{2,6})/);
+      if (!(v && v >= 12 && v <= 100000)) v = undefined;
+      f = firstInt(t.frequency, /^(\d{1,3})(?:\.\d+)?$/);
+      if (!(f != null && f >= 0 && f <= 400)) f = undefined;
+    }
+    const preset = E_PRESETS.findIndex(([pe, pv, pf]) => pe === e && pv === v && pf === f);
+    if (preset >= 0) prop.e = 4 + preset;
+    else {
+      prop.e = e;
+      if (v !== undefined) prop.v = v;
+      if (f !== undefined) prop.f = f;
+    }
+  }
+  const tr = technical ? firstInt(t.tracks, /^(\d{1,2})$/) : null;
+  if (tr && tr >= 1 && tr <= 16) prop.x = tr;
+  // ray açıklığı: 1435 (normal hat, ~%99) 1 koduyla yazılır; diğer değerler mm
+  const g = technical ? firstInt(t.gauge, /^(\d{3,4})$/) : null;
+  if (g && g >= 100 && g <= 3000) prop.g = g === 1435 ? 1 : g;
+  // ham usage/service: yalnızca sınıf (c, inşaat/önerilen hatlarda k) bunu zaten söylemiyorsa:
+  // main/branch/industrial c ile kodlu; askeri, turistik, test, yük vb. yazılır
+  const slug = (v) => { const s = clean(v, 20); return s && /^[a-z_]+$/.test(s) ? s : null; };
+  const us = slug(usage);
+  if (us && !USAGE_IN_CLASS.has(us)) prop.us = us;
+  const sv = slug(service);
+  if (sv && !['siding', 'yard', 'crossover', 'spur'].includes(sv)) prop.sv = sv;
+}
 
 function classifyWay(t) {
   const rw = t.railway;
@@ -166,6 +241,7 @@ function classifyWay(t) {
 
   if (t.tunnel === 'yes') prop.t = 1;
   if (BRIDGES.has(t.bridge)) prop.b = 1;
+  addInfo(prop, t, usage, service);
 
   // Hız (hız limitleri katmanı)
   const plain = speedOf(t.maxspeed);
@@ -194,6 +270,18 @@ function classifyNode(t) {
   else if (rw === 'yard') prop.c = 'yd';
   else if (rw === 'tram_stop') prop.c = 'ts';
   else return null;
+  const op = clean(t.operator, 60);
+  if (op) prop.o = op;
+  return prop;
+}
+
+// yerler: p yer türü (c şehir, t kasaba, v köy, o diğer), q idari seviye (4 il merkezi, 6 ilçe merkezi)
+const PLACE_CODE = { city: 'c', town: 't', village: 'v' };
+function classifyPlace(t, level) {
+  const name = clean(t['name:tr'] || t.name, 80);
+  if (!name) return null;
+  const prop = { c: 'pl', n: name, p: PLACE_CODE[t.place] || 'o' };
+  if (level) prop.q = level;
   return prop;
 }
 
@@ -251,6 +339,9 @@ async function main() {
   const rail = await overpass('ways_rail', QUERIES.ways_rail);
   const other = await overpass('ways_other', QUERIES.ways_other);
   const nodes = await overpass('nodes', QUERIES.nodes);
+  const placesRaw = await overpass('places', PLACE_QUERIES.places);
+  const admin4 = await overpass('admin4', PLACE_QUERIES.admin4);
+  const admin6 = await overpass('admin6', PLACE_QUERIES.admin6);
 
   const osmBase = rail.osm3s?.timestamp_osm_base ?? null;
   const osmBases = [rail, other, nodes].map((r) => r.osm3s?.timestamp_osm_base).filter(Boolean).sort();
@@ -292,6 +383,31 @@ async function main() {
     nodeSeen.add(key);
     features.push({ type: 'Feature', properties: props, geometry: { type: 'Point', coordinates: [x, y] } });
     bump(props.c);
+  }
+
+  // yerler: kimlik başına birleştir (bir düğüm hem kasaba hem ilçe merkezi olabilir); en yüksek idari seviye (küçük sayı) kazanır
+  const placeById = new Map();
+  const addPlaces = (res, level) => {
+    for (const el of res.elements) {
+      if (el.type !== 'node' || el.lat == null) continue;
+      const prev = placeById.get(el.id);
+      const pl = prev ? prev.level : 0;
+      placeById.set(el.id, { el: prev ? prev.el : el, level: level && pl ? Math.min(level, pl) : level || pl });
+    }
+  };
+  addPlaces(placesRaw, 0);
+  addPlaces(admin6, 6);
+  addPlaces(admin4, 4);
+  const placeSeen = new Set();
+  for (const { el, level } of [...placeById.values()].sort((a, b) => a.el.id - b.el.id)) {
+    const props = classifyPlace(el.tags || {}, level);
+    if (!props) continue;
+    const x = r5(el.lon), y = r5(el.lat);
+    const key = props.n + '|' + x + '|' + y;
+    if (placeSeen.has(key)) continue;
+    placeSeen.add(key);
+    features.push({ type: 'Feature', properties: props, geometry: { type: 'Point', coordinates: [x, y] } });
+    bump('pl');
   }
 
   const fc = { type: 'FeatureCollection', features };

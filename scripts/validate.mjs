@@ -8,19 +8,23 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const SUPPORTED_SCHEMA = 1;
+const SUPPORTED_SCHEMA = 2;
 // Türkiye sınır kutusu (uygulamadaki config.ts TURKEY_BOUNDS ile aynı)
 const BBOX = { south: 35.6, west: 25.5, north: 42.3, east: 45.0 };
 const WAY_CLASSES = new Set(['hs', 'main', 'branch', 'ind', 'inds', 'oth', 'siding', 'yard', 'cross', 'spur', 'nar', 'nars', 'tram', 'sub', 'lr', 'con', 'prop', 'dis', 'aba', 'raz', 'pre']);
-const NODE_CLASSES = new Set(['st', 'ht', 'yd', 'ts']);
+const NODE_CLASSES = new Set(['st', 'ht', 'yd', 'ts']); // istasyon düğümleri
+const PLACE_CLASS = 'pl'; // arama için yer noktaları (haritada çizilmez)
 const KEYS = new Set(['h', 'm', 'b', 'i', 'l', 'u', 't']);
-const ALLOWED_PROPS = new Set(['c', 'k', 's', 'd', 't', 'b', 'u', 'n', 'm']);
+// Stil anahtarları: c k s d t b u n m.  Bilgi kartı (v2): r o e v f x g us sv (hatlar), o (istasyonlar), p q (yerler)
+const ALLOWED_PROPS = new Set(['c', 'k', 's', 'd', 't', 'b', 'u', 'n', 'm', 'r', 'o', 'e', 'v', 'f', 'x', 'g', 'us', 'sv', 'p', 'q']);
+const WAY_ONLY = ['r', 'e', 'v', 'f', 'x', 'g', 'us', 'sv'];
+const PLACE_TYPES = new Set(['c', 't', 'v', 'o']);
 const MIN_BYTES = 2e6, MAX_BYTES = 15e6;
 // Önceki yayına göre en az bu oran korunmalı (ana kategoriler ve toplam)
 const KEEP_RATIO = 0.8;
-const MAJOR = ['hs', 'main', 'branch', 'tram', 'sub', 'st'];
+const MAJOR = ['hs', 'main', 'branch', 'tram', 'sub', 'st', 'pl'];
 // Önceki yayın yoksa mutlak taban değerler (2026-11 verisinin yaklaşık yarısı)
-const FLOORS = { features: 12000, hs: 1000, main: 3000, branch: 100, tram: 500, sub: 800, st: 600 };
+const FLOORS = { features: 12000, hs: 1000, main: 3000, branch: 100, tram: 500, sub: 800, st: 600, pl: 300 };
 
 const errors = [];
 const fail = (m) => errors.push(m);
@@ -49,14 +53,28 @@ if (gj) {
       const p = f?.properties, g = f?.geometry;
       if (f?.type !== 'Feature' || !p || !g) { note(`#${i}: Feature yapısı bozuk`); continue; }
       for (const k of Object.keys(p)) if (!ALLOWED_PROPS.has(k)) note(`#${i}: bilinmeyen özellik ${k}`);
-      const isNode = NODE_CLASSES.has(p.c);
+      const isPlace = p.c === PLACE_CLASS;
+      const isNode = NODE_CLASSES.has(p.c) || isPlace;
       if (!isNode && !WAY_CLASSES.has(p.c)) { note(`#${i}: bilinmeyen sınıf ${p.c}`); continue; }
       counts[p.c] = (counts[p.c] || 0) + 1;
       if (p.k !== undefined && !KEYS.has(p.k)) note(`#${i}: bilinmeyen renk anahtarı ${p.k}`);
       for (const k of ['s', 'd']) if (p[k] !== undefined && !(Number.isInteger(p[k]) && p[k] > 0 && p[k] < 1000)) note(`#${i}: ${k} sayı değil`);
       for (const k of ['t', 'b', 'u', 'm']) if (p[k] !== undefined && p[k] !== 1) note(`#${i}: ${k} !== 1`);
+      // bilgi kartı alanları
+      for (const k of ['n', 'r', 'o', 'us', 'sv']) if (p[k] !== undefined && (typeof p[k] !== 'string' || !p[k] || p[k].length > 100)) note(`#${i}: ${k} geçersiz dizge`);
+      if (p.e !== undefined && ![0, 1, 2, 3, 4, 5, 6, 7].includes(p.e)) note(`#${i}: e geçersiz`);
+      if ((p.v !== undefined || p.f !== undefined) && ![1, 2, 3].includes(p.e)) note(`#${i}: v/f yalnızca e 1-3 ile`);
+      if (p.v !== undefined && !(Number.isInteger(p.v) && p.v >= 12 && p.v <= 100000)) note(`#${i}: v geçersiz`);
+      if (p.f !== undefined && !(Number.isInteger(p.f) && p.f >= 0 && p.f <= 400)) note(`#${i}: f geçersiz`);
+      if (p.x !== undefined && !(Number.isInteger(p.x) && p.x >= 1 && p.x <= 16)) note(`#${i}: x geçersiz`);
+      if (p.g !== undefined && !(Number.isInteger(p.g) && (p.g === 1 || (p.g >= 100 && p.g <= 3000)))) note(`#${i}: g geçersiz`);
+      if (p.p !== undefined && !(isPlace && PLACE_TYPES.has(p.p))) note(`#${i}: p geçersiz`);
+      if (p.q !== undefined && !(isPlace && (p.q === 4 || p.q === 6))) note(`#${i}: q geçersiz`);
+      if (isNode) for (const k of WAY_ONLY) if (p[k] !== undefined) note(`#${i}: düğümde hat özelliği ${k}`);
+      if (isPlace && p.o !== undefined) note(`#${i}: yerde işletmeci`);
       if (isNode) {
-        if (typeof p.n !== 'string' || !p.n) note(`#${i}: istasyonda ad yok`);
+        if (typeof p.n !== 'string' || !p.n) note(`#${i}: istasyonda/yerde ad yok`);
+        if (isPlace && !PLACE_TYPES.has(p.p)) note(`#${i}: yerde tür (p) yok`);
         if (g.type !== 'Point') note(`#${i}: nokta bekleniyordu`);
       } else if (g.type !== 'LineString' || !Array.isArray(g.coordinates) || g.coordinates.length < 2) note(`#${i}: LineString bekleniyordu`);
       const cs = g.type === 'Point' ? [g.coordinates] : g.coordinates;
