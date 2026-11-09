@@ -1,9 +1,9 @@
 {
   "schemaVersion": 2,
-  "osm_base": "2026-11-08T21:29:06Z",
-  "generatedAt": "2026-11-08T21:35:13.028Z",
-  "sha256": "5f996e1aac44e893134f68a64489cb08e153fac12b2ce1150180cd1ed012f280",
-  "bytes": 6711442,
+  "osm_base": "2026-11-09T10:53:21Z",
+  "generatedAt": "2026-11-09T11:02:46.592Z",
+  "sha256": "d420affbb344f284a63055aaac437c1f20e6ed7581f2e4a8c09a0bab29138c45",
+  "bytes": 6711436,
   "features": 24434,
   "counts": {
     "tram": 1203,
